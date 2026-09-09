@@ -22,7 +22,7 @@ sources:
     title: "Book B: Contextual History"
     author: "Example Historian"
     role: secondary
-    credibility_weight: 0.75
+    credibility_weight: 0.8
     independence_factor: 0.9
     description: "Strong synthesis and social context, with extensive citations."
     bias_notes: "Interpretive framing is partisan; factual chronology is generally strong."
