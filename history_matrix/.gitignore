@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+books/*.pdf
+output/*.xlsx
+output/*.csv
+data/*.db-wal
+data/*.db-shm

@@ -1,0 +1,14 @@
+# Python 3.11+ recommended. Upper bounds prevent surprise major-version breaks.
+instructor>=1.17,<2
+# Instructor 1.17 requires jiter<0.15; OpenAI SDK 3.x requires jiter>=0.16.
+openai>=2.0,<3
+pydantic>=2.13,<3
+pydantic-settings>=2.10,<3
+python-dotenv>=1.1,<2
+PyYAML>=6.0,<7
+PyMuPDF>=1.28,<2
+numpy>=2.0,<3
+scikit-learn>=1.6,<2
+openpyxl>=3.1,<4
+typer>=0.27,<1
+rich>=14,<15

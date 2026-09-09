@@ -1,0 +1,10 @@
+{
+  "python.defaultInterpreterPath": "/home/jayarshi/miniconda3/envs/pdf_venv/bin/python",
+  "python.condaPath": "/home/jayarshi/miniconda3/bin/conda",
+  "python.terminal.activateEnvironment": true,
+  "python.envFile": "${workspaceFolder}/.env",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}"
+  ],
+  "terminal.integrated.cwd": "${workspaceFolder}"
+}
