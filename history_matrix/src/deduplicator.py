@@ -93,8 +93,13 @@ def _singleton(row: sqlite3.Row) -> CanonicalGroup:
     return CanonicalGroup(
         raw_fact_ids=[row["id"]],
         canonical_claim=row["claim"],
+        event=row["event"],
+        taxonomy_path=row["taxonomy_path"],
+        claim_type=row["claim_type"],
         subject=row["subject"],
-        time_expression=row["time_expression"],
+        date_source=row["date_source"],
+        date_normalized=row["date_normalized"],
+        calendar=row["calendar"],
         location=row["location"],
     )
 
@@ -109,7 +114,12 @@ def _partition_component(
             "id": row["id"],
             "claim": row["claim"],
             "subject": row["subject"],
-            "time": row["time_expression"],
+            "event": row["event"],
+            "taxonomy_path": row["taxonomy_path"],
+            "claim_type": row["claim_type"],
+            "date_source": row["date_source"],
+            "date_normalized": row["date_normalized"],
+            "calendar": row["calendar"],
             "location": row["location"],
             "source_id": row["source_id"],
         }
@@ -122,6 +132,11 @@ paraphrases together. Also put directly competing values together (for example,
 different dates for the same event), because they are support/contradiction evidence
 for one disputed proposition. Do NOT merge assertions merely because they mention the
 same person, place, or event. Every input id must appear exactly once.
+
+Keep observations, documented statements, reported speech, motive claims, and
+interpretations in separate families even when they concern the same actor. Preserve
+the source date and normalized date independently. Numerical claims with different
+values belong together only when date, unit, and scope are genuinely comparable.
 
 For each family, select or rewrite one concrete, testable proposition represented by
 an input assertion. When values compete, choose one concrete formulation as the row's
@@ -166,7 +181,8 @@ def deduplicate_facts(
 
     rows = conn.execute(
         """
-        SELECT id, source_id, claim, subject, time_expression, location,
+        SELECT id, source_id, claim, subject, time_expression, location, event,
+               taxonomy_path, claim_type, date_source, date_normalized, calendar,
                embedding_json, embedding_model
         FROM raw_facts ORDER BY id
         """
@@ -193,7 +209,8 @@ def deduplicate_facts(
         stats.embedded_facts = len(missing)
         rows = conn.execute(
             """
-            SELECT id, source_id, claim, subject, time_expression, location,
+            SELECT id, source_id, claim, subject, time_expression, location, event,
+                   taxonomy_path, claim_type, date_source, date_normalized, calendar,
                    embedding_json, embedding_model
             FROM raw_facts ORDER BY id
             """
@@ -233,17 +250,24 @@ def deduplicate_facts(
             """
             INSERT INTO canonical_facts(
                 id, canonical_claim, subject, time_expression, location,
-                embedding_json, embedding_model
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                embedding_json, embedding_model, event, taxonomy_path, claim_type,
+                date_source, date_normalized, calendar
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 canonical_id,
                 group.canonical_claim,
                 group.subject,
-                group.time_expression,
+                group.date_source,
                 group.location,
                 json.dumps(vector),
                 settings.embedding_model,
+                group.event,
+                group.taxonomy_path,
+                group.claim_type.value,
+                group.date_source,
+                group.date_normalized,
+                group.calendar,
             ),
         )
         for raw_fact_id in group.raw_fact_ids:

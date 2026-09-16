@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import sqlite3
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +25,32 @@ class ParseStats:
     pages: int = 0
     chunks: int = 0
     ocr_pages: int = 0
+
+
+def resolve_tessdata_path(settings: Settings) -> Path | None:
+    """Find Tesseract language data even when Conda was not shell-activated."""
+    candidates: list[Path] = []
+    if settings.tessdata_prefix:
+        candidates.append(settings.tessdata_prefix.expanduser())
+    if value := os.environ.get("TESSDATA_PREFIX"):
+        candidates.append(Path(value).expanduser())
+    candidates.extend(
+        [
+            Path(sys.prefix) / "share" / "tessdata",
+            Path("/usr/share/tesseract-ocr/5/tessdata"),
+            Path("/usr/share/tesseract-ocr/4.00/tessdata"),
+            Path("/usr/share/tessdata"),
+        ]
+    )
+    required_languages = [item for item in settings.ocr_language.split("+") if item]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.is_dir() and all(
+            (resolved / f"{language}.traineddata").is_file()
+            for language in required_languages
+        ):
+            return resolved
+    return None
 
 
 def _sha256_file(path: Path) -> str:
@@ -72,7 +101,12 @@ def _extract_text(page: pymupdf.Page, settings: Settings) -> tuple[str, bool]:
     if len(text.strip()) >= settings.min_page_text_chars or not settings.enable_ocr:
         return text, False
     try:
-        text_page = page.get_textpage_ocr(language=settings.ocr_language, full=True)
+        tessdata = resolve_tessdata_path(settings)
+        text_page = page.get_textpage_ocr(
+            language=settings.ocr_language,
+            full=True,
+            tessdata=str(tessdata) if tessdata else None,
+        )
         return page.get_text("text", textpage=text_page, sort=True), True
     except Exception as exc:  # pragma: no cover - depends on system Tesseract
         raise RuntimeError(
@@ -187,10 +221,16 @@ def parse_books(
             conn.execute(
                 """
                 UPDATE sources
-                SET file_sha256 = ?, page_count = ?, updated_at = CURRENT_TIMESTAMP
+                SET file_sha256 = ?, page_count = ?, pdf_metadata_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (hashes[source.filename.casefold()], len(document), source.id),
+                (
+                    hashes[source.filename.casefold()],
+                    len(document),
+                    json.dumps(document.metadata or {}, ensure_ascii=False),
+                    source.id,
+                ),
             )
         conn.commit()
         stats.parsed_books += 1

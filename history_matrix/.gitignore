@@ -6,5 +6,7 @@ __pycache__/
 books/*.pdf
 output/*.xlsx
 output/*.csv
+output/*.md
+data/*.db
 data/*.db-wal
 data/*.db-shm

@@ -1,0 +1,10 @@
+name: pdf_venv
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - tesseract>=5.5
+  - pip
+  - pip:
+      - -r requirements.txt

@@ -16,18 +16,28 @@ from .config import Settings, clear_from_stage
 from .schemas import FactExtraction
 
 
-EXTRACTION_PROMPT = """You extract historical assertions from one PDF page chunk.
+EXTRACTION_PROMPT = """You extract auditable historical assertions from one PDF page chunk.
 
 Rules:
-1. Extract every externally checkable historical assertion, not opinions or pure rhetoric.
-2. Make each fact atomic: one subject, one predicate, and one object/value.
-3. Preserve uncertainty, attribution, negation, dates, quantities, and scope as qualifiers.
-4. The claim must be self-contained. Resolve pronouns only when the page makes the referent clear.
-5. evidence_quote MUST be copied verbatim from PAGE_TEXT and directly entail the claim.
-6. Do not use outside knowledge. Do not infer facts that the text merely implies weakly.
-7. If the page contains no factual historical assertion, return an empty facts list.
+1. Extract facts, source reports, and interpretations separately. Never convert an
+   author's argument, reported speech, or inferred motive into an observed fact.
+2. Make each assertion atomic but retain chronology, scope, attribution, and negation.
+3. Classify claim_type and firsthand_status from this passage, not from author prestige.
+4. Evidence classes: E1 direct document; E2 contemporary direct observation; E3
+   participant retrospective; E4 scholarly reconstruction; E5 derivative interpretation;
+   E6 reported speech/hearsay; E7 genuinely unknown. The source default is guidance only.
+5. Preserve the source's date exactly in date_source. Normalize separately only when the
+   calendar conversion is justified. Never silently replace Old Style with Gregorian.
+6. For numerical claims retain value, unit, date, and scope. Do not average values.
+7. A negative or motive claim must be explicitly marked and conservatively worded.
+8. evidence_quote MUST be copied verbatim from PAGE_TEXT and directly ground the claim.
+9. Do not use outside knowledge. If taxonomy placement is uncertain, return null.
+10. If there is no historical assertion, return an empty facts list.
 
 SOURCE: {source_title}
+SOURCE_ID: {source_id}
+DEFAULT_EVIDENCE_CLASS: {default_evidence_class}
+TAXONOMY_ROOT: CH2_1917
 PDF_PAGE: {page_number}
 PAGE_TEXT:
 ---
@@ -115,6 +125,8 @@ def _extract_one(row: sqlite3.Row, settings: Settings) -> tuple[str, FactExtract
         response = _client(settings).responses.create(
             input=EXTRACTION_PROMPT.format(
                 source_title=row["title"],
+                source_id=row["source_id"],
+                default_evidence_class=row["evidence_class_default"],
                 page_number=row["page_number"],
                 text=row["text"],
             ),
@@ -145,7 +157,8 @@ def extract_facts(
         conn.commit()
     rows = conn.execute(
         """
-        SELECT c.id, c.source_id, c.page_number, c.text, s.title
+        SELECT c.id, c.source_id, c.page_number, c.text, s.title,
+               s.evidence_class_default
         FROM chunks c JOIN sources s ON s.id = c.source_id
         WHERE c.extracted_at IS NULL
         ORDER BY c.source_id, c.page_number, c.start_char
@@ -189,8 +202,13 @@ def extract_facts(
                     INSERT OR IGNORE INTO raw_facts(
                         id, chunk_id, source_id, claim, subject, predicate, object_text,
                         time_expression, location, qualifiers_json, evidence_quote,
-                        page_number, extraction_confidence, extraction_model
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        page_number, extraction_confidence, extraction_model, event,
+                        taxonomy_path, claim_type, evidence_class, firsthand_status,
+                        date_source, date_normalized, calendar, chapter_section,
+                        reported_value, unit, scope, is_negative_claim,
+                        translation_status, quote_verified
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         fact_id,
@@ -200,13 +218,28 @@ def extract_facts(
                         fact.subject,
                         fact.predicate,
                         fact.object,
-                        fact.time_expression,
+                        fact.date_source,
                         fact.location,
                         json.dumps(fact.qualifiers, ensure_ascii=False),
                         exact_quote,
                         row["page_number"],
                         fact.confidence,
                         settings.llm_model,
+                        fact.event,
+                        fact.taxonomy_path,
+                        fact.claim_type.value,
+                        fact.evidence_class.value,
+                        fact.firsthand_status.value,
+                        fact.date_source,
+                        fact.date_normalized,
+                        fact.calendar,
+                        fact.chapter_section,
+                        fact.reported_value,
+                        fact.unit,
+                        fact.scope,
+                        int(fact.is_negative_claim),
+                        fact.translation_status,
+                        1,
                     ),
                 )
                 stats.facts_inserted += int(conn.total_changes > before)
