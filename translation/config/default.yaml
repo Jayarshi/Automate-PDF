@@ -1,0 +1,34 @@
+segmentation:
+  # regex has no model download. Also supported: sacremoses, nltk, spacy.
+  backend: regex
+  max_source_tokens: 384
+  batch_size: 8
+  spacy_model: null
+
+nllb:
+  model_path: models/nllb-200-distilled-600M-ct2-int8
+  tokenizer: models/nllb-200-distilled-600M-hf
+  device: auto                 # auto, cpu, cuda
+  compute_type: int8           # CPU: int8; GPU: float16 or int8_float16
+  beam_size: 4
+  max_decoding_length: 512
+  cpu_threads: 0
+
+post_edit:
+  enabled: false
+  provider: ollama             # ollama or vllm
+  model: qwen2.5:7b-instruct
+  base_url: http://127.0.0.1:11434
+  timeout_seconds: 120
+  temperature: 0.1
+
+quality:
+  threshold: 0.72
+  retry_threshold: 0.72
+  max_retries: 1
+  comet_enabled: false         # Enable after: pip install -e '.[comet]'
+  comet_model: Unbabel/wmt22-cometkiwi-da
+  min_length_ratio: 0.35
+  max_length_ratio: 3.0
+  max_copy_ratio: 0.85
+  review_path: data/review/flagged.jsonl

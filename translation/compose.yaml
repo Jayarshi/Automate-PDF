@@ -1,0 +1,25 @@
+services:
+  translator:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      TRANSLATION_CONFIG: /app/config/default.yaml
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      - ./models:/app/models:ro
+      - ./data/review:/app/data/review
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama-data:
+

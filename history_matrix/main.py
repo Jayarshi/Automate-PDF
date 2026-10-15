@@ -18,6 +18,7 @@ from src.config import Settings, connect_db, initialize_database, load_sources, 
 from src.deduplicator import deduplicate_facts
 from src.exporter import export_ledger
 from src.extractor import extract_facts
+from src.llm import backend_health, pull_local_models
 from src.parser import parse_books, resolve_tessdata_path
 from src.scorer import score_facts
 
@@ -156,11 +157,12 @@ def run_all(
     stages = ["parse", "extract", "deduplicate", "align", "score", "export"]
     start = stages.index(from_stage)
     if start <= stages.index("align"):
-        settings.require_api_key()
+        settings.require_llm()
     with connect_db(settings) as conn:
         sync_manifest(conn, manifest)
         conn.commit()
         for index, stage_name in enumerate(stages[start:], start=start):
+            console.print(f"[cyan]Starting {stage_name}...[/cyan]")
             stage_force = force and index == start
             if stage_name == "parse":
                 result = parse_books(conn, settings, manifest, force=stage_force)
@@ -223,7 +225,7 @@ def status(
 def doctor(
     project_dir: Path = typer.Option(Path(__file__).resolve().parent, help="Project root."),
 ) -> None:
-    """Check configuration, PDFs, OCR, API access, and SQLite integrity."""
+    """Check configuration, PDFs, OCR, LLM backend, and SQLite integrity."""
     settings = _settings(project_dir)
     manifest = load_sources(settings.sources_path)
     configured = {source.filename.casefold(): source.filename for source in manifest.sources}
@@ -237,6 +239,7 @@ def doctor(
             tesseract = str(environment_tesseract)
     tessdata = resolve_tessdata_path(settings)
 
+    backend_detail, backend_ready = backend_health(settings)
     checks: list[tuple[str, str, bool]] = [
         ("sources.md policy", f"valid ({len(manifest.sources)} sources)", True),
         (
@@ -261,15 +264,8 @@ def doctor(
             ),
             (bool(tesseract) and bool(tessdata)) or not settings.enable_ocr,
         ),
-        (
-            "OpenAI API key",
-            (
-                "configured"
-                if settings.openai_api_key
-                else f"blank in {settings.project_root / '.env'}"
-            ),
-            bool(settings.openai_api_key),
-        ),
+        ("LLM provider", settings.llm_provider, True),
+        ("LLM backend", backend_detail, backend_ready),
     ]
     with connect_db(settings) as conn:
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
@@ -284,6 +280,20 @@ def doctor(
     console.print(table)
     if any(not passed for _, _, passed in checks):
         raise typer.Exit(code=1)
+
+
+@app.command("pull-models")
+def pull_models(
+    project_dir: Path = typer.Option(Path(__file__).resolve().parent, help="Project root."),
+) -> None:
+    """Download the configured local Ollama generation and embedding models."""
+    settings = _settings(project_dir)
+    console.print(
+        f"Pulling [cyan]{settings.llm_model}[/cyan] and "
+        f"[cyan]{settings.embedding_model}[/cyan]. This can take several minutes."
+    )
+    for model in pull_local_models(settings):
+        console.print(f"[green]Ready[/green] {model}")
 
 
 if __name__ == "__main__":

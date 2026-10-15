@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
-import instructor
 import numpy as np
 
 from .config import Settings, SourceManifest, clear_from_stage
+from .llm import ensure_backend, structured_response
 from .schemas import ContradictionType, Coverage, Stance, StanceDecision
 
 
@@ -25,21 +24,6 @@ class AlignmentStats:
     covered_but_silent: int = 0
     not_covered: int = 0
     failed: int = 0
-
-
-_thread_state = threading.local()
-
-
-def _client(settings: Settings):
-    client = getattr(_thread_state, "instructor_client", None)
-    if client is None:
-        client = instructor.from_provider(
-            f"openai/{settings.llm_model}",
-            mode=instructor.Mode.RESPONSES_TOOLS,
-            api_key=settings.openai_api_key,
-        )
-        _thread_state.instructor_client = client
-    return client
 
 
 def _judge(
@@ -69,11 +53,7 @@ SOURCE: {source['title']}
 CANDIDATES:
 {json.dumps(candidates, ensure_ascii=False, indent=2)}
 """
-    return _client(settings).responses.create(
-        input=prompt,
-        response_model=StanceDecision,
-        max_retries=settings.llm_max_retries,
-    )
+    return structured_response(settings, prompt, StanceDecision)
 
 
 def _safe_decision(
@@ -152,7 +132,7 @@ def align_sources(
     *,
     force: bool = False,
 ) -> AlignmentStats:
-    settings.require_api_key()
+    ensure_backend(settings)
     if force:
         clear_from_stage(conn, "align")
         conn.commit()
@@ -263,61 +243,86 @@ def align_sources(
         (canonical["id"], source["id"]): {item["id"] for item in candidates}
         for canonical, source, candidates in jobs
     }
+    job_iterator = iter(jobs)
     with ThreadPoolExecutor(max_workers=settings.llm_workers) as pool:
-        futures = [
-            pool.submit(_safe_decision, canonical, source, candidates, settings)
-            for canonical, source, candidates in jobs
-        ]
-        for future in as_completed(futures):
-            canonical_id, source_id, decision, error = future.result()
-            if error:
-                stats.failed += 1
-                if settings.fail_fast:
-                    raise RuntimeError(f"Alignment failed for {canonical_id}/{source_id}: {error}")
-                continue
-            assert decision is not None
-            allowed = candidate_ids[(canonical_id, source_id)]
-            support_ids = [item for item in decision.support_evidence_ids if item in allowed]
-            contradiction_ids = [
-                item for item in decision.contradiction_evidence_ids if item in allowed
-            ]
-            if support_ids and contradiction_ids:
-                stance = Stance.MIXED
-            elif support_ids:
-                stance = (
-                    decision.stance
-                    if decision.stance in {Stance.EXPLICIT_SUPPORT, Stance.IMPLICIT_SUPPORT}
-                    else Stance.EXPLICIT_SUPPORT
-                )
-            elif contradiction_ids:
-                stance = Stance.EXPLICIT_CONTRADICTION
-            else:
-                stance = Stance.SILENT
-            sanitized = StanceDecision(
-                coverage=(Coverage.COVERED_BUT_SILENT if stance == Stance.SILENT else Coverage.COVERED),
-                stance=stance,
-                support_evidence_ids=support_ids,
-                contradiction_evidence_ids=contradiction_ids,
-                contradiction_type=(
-                    decision.contradiction_type
-                    if contradiction_ids else None
-                ),
-                confidence=decision.confidence,
-                rationale=decision.rationale,
-                chronology_notes=decision.chronology_notes,
-                scope_notes=decision.scope_notes,
-            )
-            _insert_decision(conn, canonical_id, source_id, sanitized, manifest, settings.llm_model)
-            conn.commit()
-            stats.decisions += 1
-            if stance == Stance.EXPLICIT_SUPPORT:
-                stats.explicit_support += 1
-            elif stance == Stance.IMPLICIT_SUPPORT:
-                stats.implicit_support += 1
-            elif stance == Stance.EXPLICIT_CONTRADICTION:
-                stats.contradictions += 1
-            elif stance == Stance.MIXED:
-                stats.mixed += 1
-            else:
-                stats.covered_but_silent += 1
+        pending = {
+            pool.submit(_safe_decision, *job, settings)
+            for job in [next(job_iterator, None) for _ in range(settings.llm_workers)]
+            if job is not None
+        }
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                canonical_id, source_id, decision, error = future.result()
+                if error:
+                    stats.failed += 1
+                    if settings.fail_fast:
+                        raise RuntimeError(
+                            f"Alignment failed for {canonical_id}/{source_id}: {error}"
+                        )
+                else:
+                    assert decision is not None
+                    allowed = candidate_ids[(canonical_id, source_id)]
+                    support_ids = [
+                        item for item in decision.support_evidence_ids if item in allowed
+                    ]
+                    contradiction_ids = [
+                        item
+                        for item in decision.contradiction_evidence_ids
+                        if item in allowed
+                    ]
+                    if support_ids and contradiction_ids:
+                        stance = Stance.MIXED
+                    elif support_ids:
+                        stance = (
+                            decision.stance
+                            if decision.stance
+                            in {Stance.EXPLICIT_SUPPORT, Stance.IMPLICIT_SUPPORT}
+                            else Stance.EXPLICIT_SUPPORT
+                        )
+                    elif contradiction_ids:
+                        stance = Stance.EXPLICIT_CONTRADICTION
+                    else:
+                        stance = Stance.SILENT
+                    sanitized = StanceDecision(
+                        coverage=(
+                            Coverage.COVERED_BUT_SILENT
+                            if stance == Stance.SILENT
+                            else Coverage.COVERED
+                        ),
+                        stance=stance,
+                        support_evidence_ids=support_ids,
+                        contradiction_evidence_ids=contradiction_ids,
+                        contradiction_type=(
+                            decision.contradiction_type if contradiction_ids else None
+                        ),
+                        confidence=decision.confidence,
+                        rationale=decision.rationale,
+                        chronology_notes=decision.chronology_notes,
+                        scope_notes=decision.scope_notes,
+                    )
+                    _insert_decision(
+                        conn,
+                        canonical_id,
+                        source_id,
+                        sanitized,
+                        manifest,
+                        settings.llm_identity,
+                    )
+                    conn.commit()
+                    stats.decisions += 1
+                    if stance == Stance.EXPLICIT_SUPPORT:
+                        stats.explicit_support += 1
+                    elif stance == Stance.IMPLICIT_SUPPORT:
+                        stats.implicit_support += 1
+                    elif stance == Stance.EXPLICIT_CONTRADICTION:
+                        stats.contradictions += 1
+                    elif stance == Stance.MIXED:
+                        stats.mixed += 1
+                    else:
+                        stats.covered_but_silent += 1
+
+                next_job = next(job_iterator, None)
+                if next_job is not None:
+                    pending.add(pool.submit(_safe_decision, *next_job, settings))
     return stats

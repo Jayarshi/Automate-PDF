@@ -190,17 +190,23 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", case_sensitive=False, extra="ignore")
 
     project_root: Path
+    llm_provider: Literal["ollama", "openai"] = "ollama"
     openai_api_key: str | None = None
-    llm_model: str = "gpt-5.4-mini"
+    llm_model: str = "qwen3.5:4b"
     llm_max_retries: int = Field(default=3, ge=0, le=10)
-    llm_workers: int = Field(default=4, ge=1, le=32)
-    embedding_model: str = "text-embedding-3-small"
-    embedding_batch_size: int = Field(default=128, ge=1, le=2048)
+    llm_workers: int = Field(default=1, ge=1, le=32)
+    llm_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
+    llm_context_tokens: int = Field(default=8192, ge=4096, le=262144)
+    llm_max_output_tokens: int = Field(default=6144, ge=256, le=65536)
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    ollama_keep_alive: str = "10m"
+    embedding_model: str = "qwen3-embedding:0.6b"
+    embedding_batch_size: int = Field(default=32, ge=1, le=2048)
     dedup_similarity_threshold: float = Field(default=0.82, ge=0, le=1)
     alignment_retrieval_threshold: float = Field(default=0.62, ge=0, le=1)
     alignment_top_k: int = Field(default=16, ge=1, le=100)
-    chunk_size_chars: int = Field(default=9000, ge=1000)
-    chunk_overlap_chars: int = Field(default=700, ge=0)
+    chunk_size_chars: int = Field(default=3500, ge=1000)
+    chunk_overlap_chars: int = Field(default=250, ge=0)
     enable_ocr: bool = True
     ocr_language: str = "eng"
     tessdata_prefix: Path | None = None
@@ -211,6 +217,10 @@ class Settings(BaseSettings):
     def validate_chunk_overlap(self) -> "Settings":
         if self.chunk_overlap_chars >= self.chunk_size_chars:
             raise ValueError("CHUNK_OVERLAP_CHARS must be smaller than CHUNK_SIZE_CHARS")
+        if self.llm_max_output_tokens >= self.llm_context_tokens:
+            raise ValueError(
+                "LLM_MAX_OUTPUT_TOKENS must be smaller than LLM_CONTEXT_TOKENS"
+            )
         return self
 
     @property
@@ -235,12 +245,20 @@ class Settings(BaseSettings):
         load_dotenv(root / ".env", override=False)
         return cls(project_root=root)
 
-    def require_api_key(self) -> None:
-        if not self.openai_api_key:
+    def require_llm(self) -> None:
+        if self.llm_provider == "openai" and not self.openai_api_key:
             raise RuntimeError(
-                "OPENAI_API_KEY is blank. Set it in "
+                "LLM_PROVIDER=openai requires OPENAI_API_KEY in "
                 f"{self.project_root / '.env'} and run `python main.py doctor` again."
             )
+
+    @property
+    def llm_identity(self) -> str:
+        return f"{self.llm_provider}:{self.llm_model}"
+
+    @property
+    def embedding_identity(self) -> str:
+        return f"{self.llm_provider}:{self.embedding_model}"
 
 
 def load_sources(path: Path) -> SourceManifest:

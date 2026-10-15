@@ -7,12 +7,11 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
-import instructor
 import numpy as np
-from openai import OpenAI
 from sklearn.neighbors import NearestNeighbors
 
 from .config import Settings, clear_from_stage
+from .llm import embed_texts, ensure_backend, structured_response
 from .schemas import CanonicalGroup, DeduplicationResult
 
 
@@ -41,15 +40,6 @@ class _UnionFind:
         left_root, right_root = self.find(left), self.find(right)
         if left_root != right_root:
             self.parent[right_root] = left_root
-
-
-def _embed(client: OpenAI, texts: list[str], settings: Settings) -> list[list[float]]:
-    vectors: list[list[float]] = []
-    for start in range(0, len(texts), settings.embedding_batch_size):
-        batch = texts[start : start + settings.embedding_batch_size]
-        response = client.embeddings.create(model=settings.embedding_model, input=batch)
-        vectors.extend(item.embedding for item in sorted(response.data, key=lambda item: item.index))
-    return vectors
 
 
 def _components(matrix: np.ndarray, threshold: float) -> list[list[int]]:
@@ -148,16 +138,7 @@ when central to the proposition.
 CANDIDATES:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 """
-    client = instructor.from_provider(
-        f"openai/{settings.llm_model}",
-        mode=instructor.Mode.RESPONSES_TOOLS,
-        api_key=settings.openai_api_key,
-    )
-    result = client.responses.create(
-        input=prompt,
-        response_model=DeduplicationResult,
-        max_retries=settings.llm_max_retries,
-    )
+    result = structured_response(settings, prompt, DeduplicationResult)
     expected = [row["id"] for row in component_rows]
     observed = [fact_id for group in result.groups for fact_id in group.raw_fact_ids]
     if len(observed) != len(set(observed)) or set(observed) != set(expected):
@@ -171,7 +152,7 @@ def deduplicate_facts(
     *,
     force: bool = False,
 ) -> DeduplicationStats:
-    settings.require_api_key()
+    ensure_backend(settings)
     if force:
         clear_from_stage(conn, "deduplicate")
         conn.commit()
@@ -191,19 +172,19 @@ def deduplicate_facts(
         raise RuntimeError("No raw facts found. Run the extract stage first.")
 
     stats = DeduplicationStats()
-    openai_client = OpenAI(api_key=settings.openai_api_key)
     missing = [
         row for row in rows
-        if not row["embedding_json"] or row["embedding_model"] != settings.embedding_model
+        if not row["embedding_json"]
+        or row["embedding_model"] != settings.embedding_identity
     ]
     if missing:
-        vectors = _embed(openai_client, [row["claim"] for row in missing], settings)
+        vectors = embed_texts([row["claim"] for row in missing], settings)
         for row, vector in zip(missing, vectors):
             conn.execute(
                 """
                 UPDATE raw_facts SET embedding_json=?, embedding_model=? WHERE id=?
                 """,
-                (json.dumps(vector), settings.embedding_model, row["id"]),
+                (json.dumps(vector), settings.embedding_identity, row["id"]),
             )
         conn.commit()
         stats.embedded_facts = len(missing)
@@ -236,9 +217,7 @@ def deduplicate_facts(
         else:
             groups.extend(partitioned)
 
-    canonical_vectors = _embed(
-        openai_client, [group.canonical_claim for group in groups], settings
-    )
+    canonical_vectors = embed_texts([group.canonical_claim for group in groups], settings)
     raw_index = {row["id"]: index for index, row in enumerate(rows)}
     for group, vector in zip(groups, canonical_vectors):
         canonical_id = hashlib.sha256(
@@ -261,7 +240,7 @@ def deduplicate_facts(
                 group.date_source,
                 group.location,
                 json.dumps(vector),
-                settings.embedding_model,
+                settings.embedding_identity,
                 group.event,
                 group.taxonomy_path,
                 group.claim_type.value,

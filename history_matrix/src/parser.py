@@ -15,12 +15,13 @@ import pymupdf
 from .config import Settings, SourceManifest, sync_manifest
 
 
-PARSER_VERSION = "page-chunker-v1"
+PARSER_VERSION = "page-chunker-v2"
 
 
 @dataclass(slots=True)
 class ParseStats:
     parsed_books: int = 0
+    rechunked_books: int = 0
     skipped_books: int = 0
     pages: int = 0
     chunks: int = 0
@@ -96,6 +97,46 @@ def _split_page(text: str, size: int, overlap: int) -> list[tuple[int, int, str]
     return chunks
 
 
+def _insert_chunks(
+    conn: sqlite3.Connection,
+    *,
+    page_id: int,
+    source_id: str,
+    page_number: int,
+    text: str,
+    settings: Settings,
+) -> int:
+    page_chunks = _split_page(
+        text,
+        settings.chunk_size_chars,
+        settings.chunk_overlap_chars,
+    )
+    for start, end, chunk_text in page_chunks:
+        chunk_id = _sha256_text(
+            f"{source_id}\0{page_number}\0{start}\0{end}\0{chunk_text}"
+        )[:32]
+        conn.execute(
+            """
+            INSERT INTO chunks(
+                id, page_id, source_id, page_number, start_char, end_char,
+                text, token_estimate, parser_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chunk_id,
+                page_id,
+                source_id,
+                page_number,
+                start,
+                end,
+                chunk_text,
+                max(1, len(chunk_text) // 4),
+                PARSER_VERSION,
+            ),
+        )
+    return len(page_chunks)
+
+
 def _extract_text(page: pymupdf.Page, settings: Settings) -> tuple[str, bool]:
     text = page.get_text("text", sort=True)
     if len(text.strip()) >= settings.min_page_text_chars or not settings.enable_ocr:
@@ -137,6 +178,13 @@ def parse_books(
         raise ValueError("; ".join(details))
 
     hashes = {path.name.casefold(): _sha256_file(path) for path in actual_paths}
+    chunk_fingerprint = (
+        f"{PARSER_VERSION}:{settings.chunk_size_chars}:{settings.chunk_overlap_chars}"
+    )
+    old_chunk_row = conn.execute(
+        "SELECT value FROM pipeline_meta WHERE key='chunk_fingerprint'"
+    ).fetchone()
+    chunking_changed = old_chunk_row is None or old_chunk_row["value"] != chunk_fingerprint
     changed_ids: list[str] = []
     for source in manifest.sources:
         row = conn.execute(
@@ -145,12 +193,42 @@ def parse_books(
         if force or not row or row["file_sha256"] != hashes[source.filename.casefold()]:
             changed_ids.append(source.id)
 
-    stats = ParseStats(skipped_books=len(manifest.sources) - len(changed_ids))
-    if not changed_ids:
+    unchanged_ids = [
+        source.id for source in manifest.sources if source.id not in changed_ids
+    ]
+    stats = ParseStats(skipped_books=len(unchanged_ids))
+    if not changed_ids and not chunking_changed:
         return stats
 
     # Any changed evidence invalidates canonicalization and every downstream judgment.
     conn.execute("DELETE FROM canonical_facts")
+
+    if chunking_changed:
+        for source_id in unchanged_ids:
+            pages = conn.execute(
+                """
+                SELECT id, page_number, text FROM pages
+                WHERE source_id=? ORDER BY page_number
+                """,
+                (source_id,),
+            ).fetchall()
+            if not pages:
+                if source_id not in changed_ids:
+                    changed_ids.append(source_id)
+                continue
+            conn.execute("DELETE FROM chunks WHERE source_id=?", (source_id,))
+            for page in pages:
+                stats.chunks += _insert_chunks(
+                    conn,
+                    page_id=page["id"],
+                    source_id=source_id,
+                    page_number=page["page_number"],
+                    text=page["text"],
+                    settings=settings,
+                )
+            stats.rechunked_books += 1
+            stats.skipped_books -= 1
+        conn.commit()
 
     for source in manifest.sources:
         if source.id not in changed_ids:
@@ -183,35 +261,17 @@ def parse_books(
                     ),
                 )
                 page_id = int(cursor.lastrowid)
-                page_chunks = _split_page(
-                    text, settings.chunk_size_chars, settings.chunk_overlap_chars
+                page_chunk_count = _insert_chunks(
+                    conn,
+                    page_id=page_id,
+                    source_id=source.id,
+                    page_number=page_number,
+                    text=text,
+                    settings=settings,
                 )
-                for start, end, chunk_text in page_chunks:
-                    chunk_id = _sha256_text(
-                        f"{source.id}\0{page_number}\0{start}\0{end}\0{chunk_text}"
-                    )[:32]
-                    conn.execute(
-                        """
-                        INSERT INTO chunks(
-                            id, page_id, source_id, page_number, start_char, end_char,
-                            text, token_estimate, parser_version
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            chunk_id,
-                            page_id,
-                            source.id,
-                            page_number,
-                            start,
-                            end,
-                            chunk_text,
-                            max(1, len(chunk_text) // 4),
-                            PARSER_VERSION,
-                        ),
-                    )
                 stats.pages += 1
-                stats.chunks += len(page_chunks)
-                book_chunk_count += len(page_chunks)
+                stats.chunks += page_chunk_count
+                book_chunk_count += page_chunk_count
                 stats.ocr_pages += int(used_ocr)
             if len(document) and book_chunk_count == 0:
                 raise RuntimeError(
@@ -234,4 +294,9 @@ def parse_books(
             )
         conn.commit()
         stats.parsed_books += 1
+    conn.execute(
+        "INSERT OR REPLACE INTO pipeline_meta(key, value) VALUES('chunk_fingerprint', ?)",
+        (chunk_fingerprint,),
+    )
+    conn.commit()
     return stats

@@ -6,13 +6,11 @@ import hashlib
 import json
 import re
 import sqlite3
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
-import instructor
-
 from .config import Settings, clear_from_stage
+from .llm import ensure_backend, structured_response
 from .schemas import FactExtraction
 
 
@@ -30,7 +28,9 @@ Rules:
    calendar conversion is justified. Never silently replace Old Style with Gregorian.
 6. For numerical claims retain value, unit, date, and scope. Do not average values.
 7. A negative or motive claim must be explicitly marked and conservatively worded.
-8. evidence_quote MUST be copied verbatim from PAGE_TEXT and directly ground the claim.
+8. evidence_quote MUST be a short verbatim substring copied from PAGE_TEXT and directly
+   ground the claim. Before returning, verify every quote character-for-character; never
+   modernize spelling, repair OCR, join words, or paraphrase inside quotation marks.
 9. Do not use outside knowledge. If taxonomy placement is uncertain, return null.
 10. If there is no historical assertion, return an empty facts list.
 
@@ -53,21 +53,6 @@ class ExtractionStats:
     facts_inserted: int = 0
     rejected_quotes: int = 0
     failed_chunks: int = 0
-
-
-_thread_state = threading.local()
-
-
-def _client(settings: Settings):
-    client = getattr(_thread_state, "instructor_client", None)
-    if client is None:
-        client = instructor.from_provider(
-            f"openai/{settings.llm_model}",
-            mode=instructor.Mode.RESPONSES_TOOLS,
-            api_key=settings.openai_api_key,
-        )
-        _thread_state.instructor_client = client
-    return client
 
 
 def _normalized_with_map(text: str) -> tuple[str, list[int]]:
@@ -122,16 +107,16 @@ def resolve_exact_quote(quote: str, page_text: str) -> str | None:
 
 def _extract_one(row: sqlite3.Row, settings: Settings) -> tuple[str, FactExtraction | None, str | None]:
     try:
-        response = _client(settings).responses.create(
-            input=EXTRACTION_PROMPT.format(
+        response = structured_response(
+            settings,
+            EXTRACTION_PROMPT.format(
                 source_title=row["title"],
                 source_id=row["source_id"],
                 default_evidence_class=row["evidence_class_default"],
                 page_number=row["page_number"],
                 text=row["text"],
             ),
-            response_model=FactExtraction,
-            max_retries=settings.llm_max_retries,
+            FactExtraction,
         )
         return row["id"], response, None
     except Exception as exc:  # surfaced in DB for resumability
@@ -151,7 +136,7 @@ def extract_facts(
     *,
     force: bool = False,
 ) -> ExtractionStats:
-    settings.require_api_key()
+    ensure_backend(settings)
     if force:
         clear_from_stage(conn, "extract")
         conn.commit()
@@ -172,85 +157,99 @@ def extract_facts(
         return stats
 
     row_by_id = {row["id"]: row for row in rows}
+    row_iterator = iter(rows)
     with ThreadPoolExecutor(max_workers=settings.llm_workers) as pool:
-        futures = [pool.submit(_extract_one, row, settings) for row in rows]
-        for future in as_completed(futures):
-            chunk_id, extraction, error = future.result()
-            row = row_by_id[chunk_id]
-            if error:
-                conn.execute(
-                    "UPDATE chunks SET extraction_error = ? WHERE id = ?", (error, chunk_id)
-                )
-                conn.commit()
-                stats.failed_chunks += 1
-                if settings.fail_fast:
-                    raise RuntimeError(f"Fact extraction failed for chunk {chunk_id}: {error}")
-                continue
+        pending = {
+            pool.submit(_extract_one, row, settings)
+            for row in [next(row_iterator, None) for _ in range(settings.llm_workers)]
+            if row is not None
+        }
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                chunk_id, extraction, error = future.result()
+                row = row_by_id[chunk_id]
+                if error:
+                    conn.execute(
+                        "UPDATE chunks SET extraction_error = ? WHERE id = ?",
+                        (error, chunk_id),
+                    )
+                    conn.commit()
+                    stats.failed_chunks += 1
+                    if settings.fail_fast:
+                        raise RuntimeError(
+                            f"Fact extraction failed for chunk {chunk_id}: {error}"
+                        )
+                else:
+                    assert extraction is not None
+                    for fact in extraction.facts:
+                        exact_quote = resolve_exact_quote(fact.evidence_quote, row["text"])
+                        if exact_quote is None:
+                            stats.rejected_quotes += 1
+                            continue
+                        fact_id = _fact_id(
+                            row["source_id"], row["page_number"], fact.claim, exact_quote
+                        )
+                        before = conn.total_changes
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO raw_facts(
+                                id, chunk_id, source_id, claim, subject, predicate,
+                                object_text, time_expression, location, qualifiers_json,
+                                evidence_quote, page_number, extraction_confidence,
+                                extraction_model, event, taxonomy_path, claim_type,
+                                evidence_class, firsthand_status, date_source,
+                                date_normalized, calendar, chapter_section, reported_value,
+                                unit, scope, is_negative_claim, translation_status,
+                                quote_verified
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                fact_id,
+                                chunk_id,
+                                row["source_id"],
+                                fact.claim,
+                                fact.subject,
+                                fact.predicate,
+                                fact.object,
+                                fact.date_source,
+                                fact.location,
+                                json.dumps(fact.qualifiers, ensure_ascii=False),
+                                exact_quote,
+                                row["page_number"],
+                                fact.confidence,
+                                settings.llm_identity,
+                                fact.event,
+                                fact.taxonomy_path,
+                                fact.claim_type.value,
+                                fact.evidence_class.value,
+                                fact.firsthand_status.value,
+                                fact.date_source,
+                                fact.date_normalized,
+                                fact.calendar,
+                                fact.chapter_section,
+                                fact.reported_value,
+                                fact.unit,
+                                fact.scope,
+                                int(fact.is_negative_claim),
+                                fact.translation_status,
+                                1,
+                            ),
+                        )
+                        stats.facts_inserted += int(conn.total_changes > before)
+                    conn.execute(
+                        """
+                        UPDATE chunks
+                        SET extracted_at=CURRENT_TIMESTAMP, extraction_error=NULL
+                        WHERE id=?
+                        """,
+                        (chunk_id,),
+                    )
+                    conn.commit()
+                    stats.processed_chunks += 1
 
-            assert extraction is not None
-            for fact in extraction.facts:
-                exact_quote = resolve_exact_quote(fact.evidence_quote, row["text"])
-                if exact_quote is None:
-                    stats.rejected_quotes += 1
-                    continue
-                fact_id = _fact_id(
-                    row["source_id"], row["page_number"], fact.claim, exact_quote
-                )
-                before = conn.total_changes
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO raw_facts(
-                        id, chunk_id, source_id, claim, subject, predicate, object_text,
-                        time_expression, location, qualifiers_json, evidence_quote,
-                        page_number, extraction_confidence, extraction_model, event,
-                        taxonomy_path, claim_type, evidence_class, firsthand_status,
-                        date_source, date_normalized, calendar, chapter_section,
-                        reported_value, unit, scope, is_negative_claim,
-                        translation_status, quote_verified
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        fact_id,
-                        chunk_id,
-                        row["source_id"],
-                        fact.claim,
-                        fact.subject,
-                        fact.predicate,
-                        fact.object,
-                        fact.date_source,
-                        fact.location,
-                        json.dumps(fact.qualifiers, ensure_ascii=False),
-                        exact_quote,
-                        row["page_number"],
-                        fact.confidence,
-                        settings.llm_model,
-                        fact.event,
-                        fact.taxonomy_path,
-                        fact.claim_type.value,
-                        fact.evidence_class.value,
-                        fact.firsthand_status.value,
-                        fact.date_source,
-                        fact.date_normalized,
-                        fact.calendar,
-                        fact.chapter_section,
-                        fact.reported_value,
-                        fact.unit,
-                        fact.scope,
-                        int(fact.is_negative_claim),
-                        fact.translation_status,
-                        1,
-                    ),
-                )
-                stats.facts_inserted += int(conn.total_changes > before)
-            conn.execute(
-                """
-                UPDATE chunks
-                SET extracted_at=CURRENT_TIMESTAMP, extraction_error=NULL
-                WHERE id=?
-                """,
-                (chunk_id,),
-            )
-            conn.commit()
-            stats.processed_chunks += 1
+                next_row = next(row_iterator, None)
+                if next_row is not None:
+                    pending.add(pool.submit(_extract_one, next_row, settings))
     return stats

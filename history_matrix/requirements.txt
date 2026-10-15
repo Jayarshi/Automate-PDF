@@ -2,6 +2,7 @@
 instructor>=1.17,<2
 # Instructor 1.17 requires jiter<0.15; OpenAI SDK 3.x requires jiter>=0.16.
 openai>=2.0,<3
+ollama>=0.6,<1
 pydantic>=2.13,<3
 pydantic-settings>=2.10,<3
 python-dotenv>=1.1,<2

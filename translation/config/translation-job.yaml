@@ -1,0 +1,35 @@
+# 1. Put the UTF-8 source text in this file.
+input_file: data/input.txt
+
+# 2. Choose the source language. Short aliases and full NLLB codes are accepted.
+source_language: bn
+
+# 3. Add one or more output languages.
+target_languages:
+  - en
+  # - hi
+  # - fr
+
+# faithful, formal, literary, academic, or colloquial
+tone: faithful
+
+# 4. Translated .txt files and detailed .report.json files are written here.
+output_directory: data/output
+
+# Translation engine settings. Use config/with-ollama.yaml for local LLM polishing.
+pipeline_config: config/default.yaml
+
+# Optional per-language terminology files. Keys must match target_languages above.
+glossary_files: {}
+# Example:
+# glossary_files:
+#   hi: config/glossary.example.yaml
+
+# Optional trusted reference translations for BLEU/chrF++ verification.
+reference_files: {}
+# Example:
+# reference_files:
+#   hi: data/reference.hi.txt
+
+document_id: example-document
+
