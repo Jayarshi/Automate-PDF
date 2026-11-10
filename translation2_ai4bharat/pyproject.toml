@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "translation2-ai4bharat"
+version = "0.1.0"
+description = "Markdown translation with AI4Bharat IndicTrans2 and consistent local LLM review"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.5",
+  "transformers>=4.51,<5",
+  "sentencepiece>=0.2",
+  "indictranstoolkit>=1.1.1,<2",
+  "langdetect>=1.0.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+translate-markdown = "indictrans2_md.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
