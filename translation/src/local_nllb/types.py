@@ -15,6 +15,7 @@ class TranslationRequest:
     glossary: dict[str, str] = field(default_factory=dict)
     reference: str | None = None
     document_id: str | None = None
+    style_guide: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

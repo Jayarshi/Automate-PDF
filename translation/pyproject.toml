@@ -19,6 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+indictrans = ["torch>=2.5", "transformers>=4.51,<5", "indictranstoolkit>=1.1.1,<2"]
 spacy = ["spacy>=3.7,<4"]
 nltk = ["nltk>=3.9,<4"]
 comet = ["unbabel-comet>=2.2,<3"]
@@ -33,6 +34,7 @@ all = [
 ]
 
 [project.scripts]
+local-translate-book = "local_nllb.book:main"
 local-translate = "local_nllb.cli:main"
 local-translate-job = "local_nllb.job:main"
 local-translate-api = "local_nllb.api:main"

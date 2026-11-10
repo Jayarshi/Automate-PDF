@@ -1,0 +1,15 @@
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/*
+!.cache/.gitkeep
+tmp/*
+!tmp/.gitkeep
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+work/*
+!work/.gitkeep
+tools/ScanTailor-v1.0.0-rc5-linux-x64.AppImage

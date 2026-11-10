@@ -1,0 +1,16 @@
+# Python 3.10–3.12. Install a matching torch/torchvision pair for your hardware first.
+# These versions define the adapter contract; do not upgrade Docling independently.
+docling==2.80.0
+docling-core==2.69.0
+surya-ocr==0.17.0
+pix2tex==0.1.4
+PyMuPDF==1.26.7
+Pillow==10.4.0
+wordfreq==3.1.1
+torch==2.7.1
+torchvision==0.22.1
+transformers==4.57.6
+# pix2tex's legacy timm/augmentation stack requires the NumPy 1.x API.
+numpy==1.26.4
+albumentations==1.4.24
+opencv-python-headless==4.11.0.86

@@ -1,0 +1,29 @@
+# New workflow: local-translate-book prepare / translate (see README).
+segmentation:
+  backend: regex
+  max_source_tokens: 256
+  batch_size: 4
+indictrans:
+  en_indic: ai4bharat/indictrans2-en-indic-1B
+  indic_en: ai4bharat/indictrans2-indic-en-1B
+  indic_indic: ai4bharat/indictrans2-indic-indic-1B
+  device: auto
+  beam_size: 5
+  max_source_tokens: 256
+  max_decoding_length: 256
+  local_files_only: false
+post_edit:
+  enabled: true
+  provider: ollama
+  model: qwen2.5:7b-instruct
+  base_url: http://127.0.0.1:11434
+  timeout_seconds: 180
+  temperature: 0.0
+quality:
+  threshold: 0.80
+  retry_threshold: 0.80
+  max_retries: 1
+  # Enable after installing .[comet]. With false, every book needs human review.
+  comet_enabled: false
+  comet_model: Unbabel/wmt22-cometkiwi-da
+  review_path: data/review/books.jsonl

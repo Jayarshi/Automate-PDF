@@ -22,7 +22,11 @@ class TranslationPipeline:
         engine: NLLBEngine | Any | None = None,
         post_editor: PostEditor | None = None,
         evaluator: QualityEvaluator | None = None,
+        book_mode: bool = False,
+        context_window: int = 2,
     ) -> None:
+        self.book_mode = book_mode
+        self.context_window = context_window
         self.config = config
         self.engine = engine or NLLBEngine(config.nllb)
         self.post_editor = post_editor or (
@@ -56,7 +60,8 @@ class TranslationPipeline:
     ) -> TranslationResult:
         source_segments = self.segmenter.segment(request.text, source_lang)
         protected = [
-            self.protector.protect(item.text, request.glossary) for item in source_segments
+            self.protector.protect(item.text, {} if self.book_mode else request.glossary)
+            for item in source_segments
         ]
         raw_candidates: list[str] = []
         for start in range(0, len(protected), max(1, self.config.segmentation.batch_size)):
@@ -66,8 +71,8 @@ class TranslationPipeline:
             )
 
         results: list[SegmentResult] = []
-        for source_segment, protected_segment, raw in zip(
-            source_segments, protected, raw_candidates, strict=True
+        for index, (source_segment, protected_segment, raw) in enumerate(
+            zip(source_segments, protected, raw_candidates, strict=True)
         ):
             results.append(
                 self._finish_segment(
@@ -77,6 +82,16 @@ class TranslationPipeline:
                     request,
                     source_lang,
                     target_lang,
+                    {
+                        "before": [
+                            s.text
+                            for s in source_segments[max(0, index - self.context_window) : index]
+                        ],
+                        "after": [
+                            s.text
+                            for s in source_segments[index + 1 : index + 1 + self.context_window]
+                        ],
+                    },
                 )
             )
 
@@ -93,6 +108,8 @@ class TranslationPipeline:
         metrics["segment_average"] = round(segment_average, 4)
         score = round(min(document_score, segment_average), 4)
         passed = all(item.passed for item in results) and score >= self.config.quality.threshold
+        if self.book_mode and document_issues:
+            passed = False
         issues = list(
             dict.fromkeys([*(issue for item in results for issue in item.issues), *document_issues])
         )
@@ -121,6 +138,7 @@ class TranslationPipeline:
         request: TranslationRequest,
         source_lang: str,
         target_lang: str,
+        context: dict | None = None,
     ) -> SegmentResult:
         attempts = 1
         current_raw = raw
@@ -129,7 +147,12 @@ class TranslationPipeline:
         while attempts <= self.config.quality.max_retries + 1:
             editor_issues: list[str] = []
             try:
-                edited = self.post_editor.edit(
+                edit = self.post_editor.edit
+                extra = {}
+                if self.book_mode:
+                    edit = self.post_editor.edit_with_context
+                    extra = {"style": request.style_guide, "context": context}
+                edited = edit(
                     protected.text,
                     current_raw,
                     source_lang,
@@ -137,6 +160,7 @@ class TranslationPipeline:
                     request.tone,
                     request.glossary,
                     retry_issues,
+                    **extra,
                 )
             except RuntimeError as exc:
                 edited = current_raw
@@ -147,12 +171,22 @@ class TranslationPipeline:
             score, metrics, issues = self.evaluator.evaluate(
                 source_segment.text, restored, request.glossary, inherited
             )
+            if self.book_mode:
+                if source_segment.text.casefold() == restored.casefold():
+                    issues.append("unchanged source requires human review")
+                for term, target in request.glossary.items():
+                    if term in source_segment.text and target not in restored:
+                        issues.append(f"missing exact glossary term: {target}")
             candidate = SegmentResult(
                 source=source_segment.text,
                 raw_translation=restored_raw,
                 translation=restored,
                 score=score,
-                passed=score >= self.config.quality.retry_threshold and not raw_restore_issues,
+                passed=(
+                    score >= self.config.quality.retry_threshold
+                    and not raw_restore_issues
+                    and (not self.book_mode or not issues)
+                ),
                 attempts=attempts,
                 metrics=metrics,
                 issues=list(dict.fromkeys([*raw_restore_issues, *issues])),
@@ -167,7 +201,9 @@ class TranslationPipeline:
                 [protected.text],
                 source_lang,
                 target_lang,
-                beam_size=max(self.config.nllb.beam_size + 2, self.config.nllb.beam_size * 2),
+                beam_size=max(self.engine.config.beam_size + 2, self.engine.config.beam_size * 2)
+                if self.book_mode
+                else max(self.config.nllb.beam_size + 2, self.config.nllb.beam_size * 2),
             )[0]
         assert best is not None
         best.attempts = attempts

@@ -12,5 +12,28 @@
   "code-runner.ignoreSelection": true,
   "code-runner.executorMap": {
     "python": "/home/jayarshi/miniconda3/envs/pdf_venv/bin/python -u"
-  }
+  },
+  "files.watcherExclude": {
+    "**/.venv*/**": true,
+    "**/.cache/**": true,
+    "**/tmp/**": true,
+    "**/tools/**": true,
+    "**/work/**": true,
+    "**/input/**": true,
+    "**/output/**": true
+  },
+  "search.exclude": {
+    "**/.venv*/**": true,
+    "**/.cache/**": true,
+    "**/tmp/**": true,
+    "**/tools/**": true,
+    "**/work/**": true
+  },
+  "python.analysis.exclude": [
+    "**/.venv*/**",
+    "**/.cache/**",
+    "**/tmp/**",
+    "**/tools/**",
+    "**/work/**"
+  ]
 }

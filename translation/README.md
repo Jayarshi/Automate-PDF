@@ -1,271 +1,126 @@
-# Local NLLB Translation Pipeline
+# Human-reviewed book translation with IndicTrans2
 
-A local-first, zero-API-cost translation service centered on NLLB-200 and
-CTranslate2. It supports CPU INT8 and GPU FP16 inference, optional local LLM
-post-editing, glossaries, automatic scoring, retries, and a human-review queue.
-
-> **License warning:** the default Meta NLLB checkpoint is licensed
-> CC-BY-NC-4.0. It is free for permitted non-commercial use, but it is not a
-> permissive commercial model. Review the [NLLB model card](https://huggingface.co/facebook/nllb-200-distilled-600M)
-> and the licenses of any Ollama/vLLM and COMET checkpoints before deployment.
-
-## Architecture
+The new workflow uses AI4Bharat IndicTrans2 for base translation and a local LLM
+(Qwen through Ollama by default) for terminology discovery and post-editing.
+A required human review separates preparation from translation. There is no NLLB
+fallback in this workflow. The older CLI/API are retained as explicit legacy
+interfaces; see [legacy documentation](docs/legacy-nllb.md).
 
 ```text
-UTF-8 text / file / REST request
-       │
-       ▼
-Sentence segmentation + token-aware chunking
-(regex default; spaCy, Sacremoses, NLTK optional)
-       │
-       ▼
-Glossary / URL / email sentinel protection
-       │
-       ▼
-NLLB-200 distilled 600M → CTranslate2 batch inference
-(INT8 CPU default; FP16 or INT8-FP16 on CUDA)
-       │
-       ▼
-Optional conservative post-editing
-(Ollama native API or vLLM OpenAI-compatible API)
-       │
-       ▼
-Restore protected terms + quality evaluation
-├─ Always: empty/length/copy/repetition/glossary/placeholder checks
-├─ Production, optional: reference-free COMET-QE
-└─ Evaluation sets: chrF++ + BLEU with a trusted reference
-       │
-       ├─ pass → translated text
-       └─ fail → larger-beam retry → JSONL human-review queue
+UTF-8 book text
+  → Qwen scans the document and proposes terminology + clarification questions
+  → STOP: human fills bilingual glossary, pronouns, honorifics, gender and register
+  → validate approval against the source hash and language pair
+  → sentence segmentation, token-limit checks, neighboring source context
+  → IndicTrans2 batch drafts
+  → Qwen applies approved rules and exact terminology to each sentence
+  → QA + optional COMET-QE → targeted retry
+  → PASS: final text | REVIEW: separate draft + JSON report + review queue
 ```
 
-BLEU and chrF++ require a trusted human reference. They are deliberately not
-computed by comparing the polished output with raw NLLB output, because that
-would produce a misleading quality score. For live traffic, enable COMET-QE.
+## Setup
 
-## Quick start (CPU, INT8)
-
-Requirements: Python 3.10–3.12, about 5 GB free disk during setup, and enough
-RAM to convert/load the 600M model. The one-time model download needs internet;
-inference itself is local.
+From this directory, using Python 3.10–3.12:
 
 ```bash
-./scripts/bootstrap.sh
+python -m venv .venv
 source .venv/bin/activate
-
-local-translate translate \
-  --source en --target hi \
-  --text 'Translation should be accurate and natural.'
-```
-
-The bootstrap creates a virtual environment, installs the service and test
-tools, downloads the Hugging Face checkpoint, and creates an INT8 CTranslate2
-model. For separate steps:
-
-```bash
-make install
-make model
-make test
-```
-
-Model conversion can be customized:
-
-```bash
-.venv/bin/python scripts/setup_model.py --quantization float16 \
-  --output-dir models/nllb-200-distilled-600M-ct2-fp16
-```
-
-Then update `nllb.model_path`, `nllb.device: cuda`, and
-`nllb.compute_type: float16` in the YAML configuration.
-
-## CLI
-
-### Easiest: edit one job file
-
-For a repeatable run, edit `config/translation-job.yaml`:
-
-1. Put the source text in `data/input.txt`.
-2. Set `source_language` and one or more entries under `target_languages`.
-3. Run `.venv/bin/python scripts/translate.py`.
-4. Read the translations and quality reports in `data/output/`.
-
-With the supplied example (`en` to `hi`), the files will be:
-
-```text
-data/output/input.hi.txt          # translated text to review
-data/output/input.hi.report.json  # score, issues, raw output, and segment details
-```
-
-Add targets such as `bn` and `fr` to create one output pair per language. The
-runner prints `PASS` or `REVIEW`; `REVIEW` means the output was still saved but
-also needs human checking. The NLLB model must first exist under `models/`—run
-`.venv/bin/python scripts/setup_model.py` once if it has not been downloaded.
-
-### Direct command
-
-Translate stdin, a file, or literal text:
-
-```bash
-printf 'Hello world.' | local-translate translate --source en --target bn
-
-local-translate translate --source eng_Latn --target fra_Latn \
-  --input source.txt --output translated.txt --tone formal
-
-local-translate translate --source en --target hi --input source.txt \
-  --glossary config/glossary.example.yaml --json
-```
-
-Aliases such as `en`, `hi`, `bn`, and `fr` are accepted. Any official NLLB
-language code such as `eng_Latn`, `hin_Deva`, or `zho_Hans` can be passed
-directly. Run `local-translate --help` for all options. Exit code `2` means the
-translation was produced but failed the quality gate and was queued for review.
-
-To score against a real reference:
-
-```bash
-local-translate translate --source en --target fr --input source.txt \
-  --reference trusted-french.txt --json
-```
-
-## Local LLM post-editor
-
-The post-editor is off by default because NLLB should remain the reliable core
-and an LLM can alter facts. When enabled, the prompt is conservative, requests
-JSON only, fixes tone/artifacts, and requires every protected placeholder to be
-preserved. Restoration and the quality gate catch missing placeholders.
-
-With Ollama:
-
-```bash
+pip install -e '.[indictrans,dev]'
 ollama pull qwen2.5:7b-instruct
-ollama serve
-local-translate --config config/with-ollama.yaml translate \
-  --source en --target hi --tone academic --input source.txt
+ollama serve  # if Ollama is not already running
 ```
 
-To use vLLM, set `post_edit.provider: vllm`, set `model` to the served model
-name, and use a base URL such as `http://127.0.0.1:8000/v1`. Both providers are
-called over localhost with Python's standard library; no paid SDK or cloud API
-is used.
+Model downloads occur on first translation. Accept any required access conditions
+on the Hugging Face checkpoint pages and authenticate locally before running.
+The adapter uses the checkpoints' Hugging Face custom code (`trust_remote_code=True`).
+After caching the models, `indictrans.local_files_only: true` disables their downloads.
+CPU inference is supported; the full 1B checkpoints can be slow and need substantial
+memory. CUDA uses FP16. Checkpoint names or local model directories can be changed
+in [config/book.yaml](config/book.yaml).
 
-## Quality gate
+The adapter follows [AI4Bharat's inference interface](https://github.com/AI4Bharat/IndicTrans2/tree/main/huggingface_interface)
+and uses [IndicTransToolkit](https://pypi.org/project/indictranstoolkit/) for preprocessing
+and postprocessing. English↔Indic and Indic↔Indic use separate checkpoints.
+Only English and the [documented IndicTrans2 languages/scripts](https://github.com/AI4Bharat/IndicTrans2#readme)
+are accepted. Use aliases such as `en`, `bn`, `hi`, or explicit codes such as
+`kas_Deva` and `mni_Mtei` when script matters. French and other unsupported languages
+are rejected before any model or LLM call.
 
-The default lightweight gate has no extra model. It catches structural failure,
-but it cannot reliably judge semantic fidelity. For unattended production,
-install and enable the reference-free COMET model:
+## 1. Generate the manual form
 
 ```bash
-.venv/bin/pip install -e '.[comet]'
-# Set quality.comet_enabled: true in config/default.yaml
+local-translate-book prepare --input data/input.txt --source bn --target en \
+  --review data/book.en.review.yaml
 ```
 
-COMET downloads its checkpoint once and then runs locally. `threshold`, length
-and copy-ratio limits, and `max_retries` are all in `config/default.yaml`.
-Failed records are appended to `data/review/flagged.jsonl` with source, raw and
-final translations, metrics, issues, and `pending_human_review` status.
+Alternatively use `.venv/bin/python -m local_nllb.book` in place of
+`local-translate-book`. Both commands accept `--config config/book.yaml`.
+Preparation scans the whole document in bounded excerpts. It writes an editable
+YAML table of glossary rows, entity rules and questions. Suggestions are advisory;
+all final target terms and style fields start blank. Existing forms are never overwritten.
 
-Treat the default `0.72` as a starting point, not a universal truth. Calibrate
-it per language pair and domain using a labeled validation set. BLEU is reported
-for compatibility; chrF++ and COMET are generally more useful for gating.
+Edit the form:
 
-## REST API
+- Fill `style_guide`: register, pronouns, honorifics and gender policy.
+- Fill every glossary `target`; remove irrelevant rows or add missing terms.
+- Fill entity gender/pronouns/honorifics. Explicit `unknown` or `none` is valid.
+- Answer the questions, then set `approved: true`.
+
+An empty glossary is allowed after review. Keep the source hash and language fields
+unchanged. Each target language needs its own form. Changing source text invalidates
+approval. The approval field is a local human checkpoint, not an authentication system.
+
+## 2. Translate the approved book
 
 ```bash
-make api
-curl -s http://localhost:8080/v1/translate \
-  -H 'content-type: application/json' \
-  -d '{
-    "text": "A careful translation.",
-    "source_lang": "en",
-    "target_lang": "hi",
-    "tone": "formal",
-    "glossary": {"translation": "अनुवाद"}
-  }'
+local-translate-book translate --input data/input.txt --source bn --target en \
+  --review data/book.en.review.yaml --output data/output/book.en.txt
 ```
 
-`GET /health` is lightweight and does not load the model. The first translation
-loads NLLB lazily. Calls are serialized because the tokenizer carries mutable
-source-language state; scale horizontally with multiple API workers/containers
-when necessary.
+Only the current sentence is translated; two preceding and two following source
+sentences provide post-editing context. Approved rules are supplied on every attempt.
+Glossary terms remain in the source draft to retain meaning, then the post-editor
+must produce their exact approved target forms. Missing terms, lost placeholders,
+number mismatches, unchanged source and editing failures require review.
+Long sentences exceeding the tokenizer budget stop the run without silent truncation;
+split them in the source and prepare a fresh form. Sentence detection is heuristic;
+inspect segmentation for abbreviations or complex literary punctuation, or select
+an installed spaCy/NLTK backend in the configuration.
 
-## Docker
+Outputs:
 
-Build the image only after `make model`; model files are mounted rather than
-baked into the image:
+- `book.en.txt`: final text, only when all gates pass.
+- `book.en.txt.review.txt`: assembled draft when any gate needs human review.
+- `book.en.txt.report.json`: segment scores, issues, attempts, raw drafts and approved rules.
+- `data/review/books.jsonl`: failed document/segment details for human review.
+
+Output files must be new paths. Exit status is `0` for success, `2` for review and
+`1` for an error. Source line breaks and indentation are retained; this operates on
+plain text and does not reconstruct PDF/DOCX typography. Preparation and translation
+are separate resumable stages; interrupted translation currently restarts that stage.
+
+## Semantic scoring
+
+The supplied profile deliberately sends every book to human review until COMET-QE
+is enabled. Structural heuristics cannot certify semantic fidelity.
 
 ```bash
-docker compose up --build translator
+pip install -e '.[comet]'
+# Set quality.comet_enabled: true in config/book.yaml
 ```
 
-To start the optional Ollama container too:
+Calibrate thresholds on human-reviewed examples for the target language/domain.
+COMET-QE is a reference-free signal, not a guarantee. chrF++/BLEU require trusted
+references and remain available through the legacy evaluation interface; they must
+not be computed against the machine draft as a quality certificate.
+
+## Verification
 
 ```bash
-docker compose --profile llm up -d ollama
-docker compose exec ollama ollama pull qwen2.5:7b-instruct
+.venv/bin/python -m pytest
 ```
 
-Enable post-editing by mounting or selecting `config/with-ollama.yaml` as
-`TRANSLATION_CONFIG`. GPU passthrough is host/runtime-specific and intentionally
-not forced in the portable Compose file.
-
-## Segmentation and terminology
-
-`regex` is dependency-free and handles common Latin, Indic, and CJK sentence
-terminators. Alternatives are selected with `segmentation.backend`:
-
-```bash
-pip install -e '.[spacy]'
-# or
-pip install -e '.[nltk]'
-```
-
-NLTK Punkt resources and spaCy language models must be downloaded explicitly.
-Sacremoses is installed in the base environment. Large sentences are split by
-the actual NLLB tokenizer count, not character length. Source line endings, blank lines,
-indentation, and trailing newlines are preserved exactly in translated output.
-
-Glossary keys found in the source are replaced with sentinels before NLLB and
-restored to their configured target forms afterward. URLs and email addresses
-receive the same treatment. For names that must never be transliterated, put
-them in the glossary (mapping a name to itself is valid). This deterministic
-approach is safer than relying on an LLM to recognize every domain entity.
-
-## Configuration profiles
-
-- `config/default.yaml`: CPU INT8, NLLB only, lightweight quality gate.
-- `config/with-ollama.yaml`: same NLLB path with Ollama post-editing enabled.
-- `.env.example`: endpoint/config overrides.
-
-All components are lazy-loaded. Config validation therefore works without
-downloading or initializing models:
-
-```bash
-local-translate --config config/default.yaml validate-config
-```
-
-## Project layout
-
-```text
-src/local_nllb/
-  segment.py       sentence splitting, token limits, batching
-  protect.py       glossary and structured-entity sentinels
-  engines/nllb.py  CTranslate2 NLLB adapter
-  engines/postedit.py  Ollama/vLLM adapters and prompt
-  quality.py       heuristics, COMET-QE, chrF++, BLEU
-  pipeline.py      orchestration, retry, review queue
-  cli.py / api.py  CLI and FastAPI entry points
-config/             deployable YAML profiles and sample glossary
-scripts/            environment/model setup
-tests/              model-free unit and integration tests
-```
-
-## Operational notes
-
-- Do not send secrets or private text to a remotely hosted Ollama/vLLM endpoint
-  unless that deployment is trusted; the project assumes localhost.
-- Keep a held-out, human-reviewed test set for every important language/domain.
-- Glossary protection is exact/Unicode-text based. Normalize upstream text if
-  your source can contain multiple Unicode representations.
-- A failed post-editor request falls back to raw NLLB, records the failure, and
-  still passes through the quality gate.
-- The repository code is MIT licensed. Model and dataset licenses are separate.
+Tests use fake engines/LLM responses and do not download weights. An actual model
+run is necessary to measure translation quality on your books. The old
+`scripts/translate.py`, `local-translate`, `local-translate-job`, and REST API still
+use the legacy NLLB configuration; use `local-translate-book` for this new workflow.
